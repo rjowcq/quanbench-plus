@@ -82,9 +82,9 @@ if [ ${#MODELS[@]} -eq 0 ]; then
 fi
 
 case "$PROVIDER" in
-  openrouter|coda) ;;
+  openrouter|coda|bedrock) ;;
   *)
-    echo "Error: unknown provider '$PROVIDER'. Use: openrouter | coda" >&2
+    echo "Error: unknown provider '$PROVIDER'. Use: openrouter | coda | bedrock" >&2
     exit 1
     ;;
 esac
