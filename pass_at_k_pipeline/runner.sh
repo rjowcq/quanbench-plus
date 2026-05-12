@@ -1,16 +1,18 @@
 PASS_K=1
 FRAMEWORK="cirq"
+PROVIDER="openrouter"
+LIMIT=""
 MODELS=()
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PYTHON_BIN="${PYTHON_BIN:-python}"
+PYTHON_BIN="${PYTHON_BIN:-$REPO_ROOT/.venv/bin/python}"
 
 PIPELINE_DIR="$REPO_ROOT/pass_at_k_pipeline"
 API_SCRIPT="$PIPELINE_DIR/api_pass_at_k.py"
 
 # Sanity: python exists
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+if [ ! -x "$PYTHON_BIN" ] && ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   if command -v python >/dev/null 2>&1; then
     PYTHON_BIN="python"
   else
@@ -20,15 +22,30 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
 fi
 
 print_help () {
-  echo "Usage: bash $(basename "$0") [--framework F] [--pass_k K] model_1 model_2 ..."
+  echo "Usage: bash $(basename "$0") [--framework F] [--pass_k K] [--provider P] [--limit N] model_1 model_2 ..."
   echo ""
-  echo "  --framework, --lang    One of: cirq | qiskit | pennylane   (default: cirq)"
+  echo "  --framework, --lang    Target quantum SDK: cirq | qiskit | pennylane   (default: cirq)"
   echo "  --pass_k               Pass@k samples (default: 1)"
+  echo "  --provider             Generation provider: openrouter | coda | bedrock (default: openrouter)"
+  echo "  --limit                Smoke-test: only run the first N tasks per model"
+  echo ""
+  echo "Provider notes:"
+  echo "  openrouter             Reads API_KEY from .env; pass OpenRouter model ids."
+  echo "  coda                   Reads CODA_API_KEY from .env. Use a label like 'coda/build'"
+  echo "                         so result files group by Coda mode. The Coda agent is the"
+  echo "                         generator; --framework still selects the target SDK."
+  echo "  bedrock                Calls AWS Bedrock Converse directly with no system prompt,"
+  echo "                         no tools, and no agent harness. Honours BEDROCK_MODEL,"
+  echo "                         BEDROCK_REGION, BEDROCK_EFFORT (low|medium|high|max),"
+  echo "                         BEDROCK_THINKING (default on). Pass any label as the"
+  echo "                         model arg; it is only used to name the result files."
   echo ""
   echo "Examples:"
-  echo "  bash $(basename "$0") --framework cirq --pass_k 5 "openai/gpt-4.1""
-  echo "  bash $(basename "$0") --framework qiskit "deepseek/deepseek-chat""
-  echo "  bash $(basename "$0") --framework pennylane "openai/gpt-4.1" "deepseek/deepseek-r1""
+  echo "  bash $(basename "$0") --framework cirq --pass_k 5 \"openai/gpt-4.1\""
+  echo "  bash $(basename "$0") --framework qiskit \"deepseek/deepseek-chat\""
+  echo "  bash $(basename "$0") --provider coda --framework qiskit --pass_k 1 coda/build"
+  echo "  bash $(basename "$0") --provider coda --framework cirq --limit 1 coda/build"
+  echo "  bash $(basename "$0") --provider bedrock --framework qiskit bedrock/opus-4-6"
 }
 
 # Parse arguments
@@ -40,6 +57,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --framework|--lang)
       FRAMEWORK="$2"
+      shift 2
+      ;;
+    --provider)
+      PROVIDER="$2"
+      shift 2
+      ;;
+    --limit)
+      LIMIT="$2"
       shift 2
       ;;
     -h|--help)
@@ -54,8 +79,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ ${#MODELS[@]} -eq 0 ]; then
-  print_help
-  exit 1
+  if [ "$PROVIDER" = "coda" ]; then
+    MODELS=("coda/build")
+    echo "No model passed; defaulting to 'coda/build' for --provider coda."
+  elif [ "$PROVIDER" = "bedrock" ]; then
+    MODELS=("bedrock/opus-4-6")
+    echo "No model passed; defaulting to 'bedrock/opus-4-6' for --provider bedrock."
+  else
+    print_help
+    exit 1
+  fi
 fi
 
 
@@ -75,18 +108,35 @@ case "$FRAMEWORK" in
     ;;
 esac
 
+case "$PROVIDER" in
+  openrouter|coda|bedrock) ;;
+  *)
+    echo "Error: unknown provider '$PROVIDER'. Use: openrouter | coda | bedrock" >&2
+    exit 1
+    ;;
+esac
+
 cd "$REPO_ROOT" || exit 1
 
 echo "Configuration:"
-echo "  Framework: $FRAMEWORK"
+echo "  Provider:       $PROVIDER"
+echo "  Framework:      $FRAMEWORK"
 echo "  Pass@k samples: $PASS_K"
+if [ -n "$LIMIT" ]; then
+  echo "  Limit:          $LIMIT task(s) per model (smoke test)"
+fi
 echo "  Models:"
 for m in "${MODELS[@]}"; do
   echo "    - $m"
 done
 echo "---"
 
-"$PYTHON_BIN" "$API_SCRIPT" --framework "$FRAMEWORK" --pass_k "$PASS_K" "${MODELS[@]}"
+API_ARGS=( --framework "$FRAMEWORK" --pass_k "$PASS_K" --provider "$PROVIDER" )
+if [ -n "$LIMIT" ]; then
+  API_ARGS+=( --limit "$LIMIT" )
+fi
+
+"$PYTHON_BIN" "$API_SCRIPT" "${API_ARGS[@]}" "${MODELS[@]}"
 "$PYTHON_BIN" "$RESULTS_SCRIPT" "${MODELS[@]}" "$PASS_K"
 
 echo "---"

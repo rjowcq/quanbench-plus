@@ -4,3 +4,13 @@
 **__pycache__**
 mvenv/
 *.egg-info/
+
+# Benchmark outputs (generated per-run)
+logs/
+model_responses/
+model_results/
+responses/
+results/
+
+# Pytest
+.pytest_cache/

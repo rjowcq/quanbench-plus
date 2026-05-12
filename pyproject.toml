@@ -42,7 +42,9 @@ dependencies = [
   "cirq-web==1.6.1",
   "qiskit",
   "qiskit-aer",
+  "qiskit-algorithms",
   "pennylane",
+  "boto3>=1.43.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -58,3 +60,7 @@ include = [
 [tool.setuptools.package-data]
 canonical_results = ["canonical_solutions.json"]
 prompts = ["*.jsonl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
