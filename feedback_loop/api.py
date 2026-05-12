@@ -25,13 +25,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import numpy as np
 import cirq
-import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from feedback_loop.defaults import NUMBER_OF_SHOTS
 from utils.get_function_signature_from_prompt import get_function_signature_from_prompt
 from utils.read_jsonl import read_jsonl
 from utils.parse_response import parse_response
+from utils.providers import (
+    CODA_PROVIDER,
+    OPENROUTER_PROVIDER,
+    SUPPORTED_PROVIDERS,
+    send_generation_request_dict,
+)
 
 from feedback_loop.defaults import (
     DEFAULT_MODELS,
@@ -95,31 +100,35 @@ def extract_assistant_text(raw: Dict[str, Any]) -> str:
         return ""
 
 
-def send_request(request_payload: Dict[str, Any]) -> Dict[str, Any]:
-    api_key = os.getenv("API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing API_KEY in environment.")
-    print("Sending request to", request_payload.get("model"))
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+def send_request(
+    request_payload: Dict[str, Any],
+    provider: str = OPENROUTER_PROVIDER,
+) -> Dict[str, Any]:
+    """Dispatch one request to the chosen provider.
 
-    resp = requests.post(url, json=request_payload, headers=headers, timeout=180)
-    return resp.json()
+    Returns the normalized response dict (OpenRouter chat-completion shape);
+    callers in this module rebuild the ``(dict, prefill)`` tuple themselves
+    when they hand off to ``parse_response``.
+    """
+    return send_generation_request_dict(request_payload, provider)
 
 
 def send_requests_in_parallel(
     request_payloads: List[Dict[str, Any]],
     max_workers: int = 16,
+    provider: str = OPENROUTER_PROVIDER,
 ) -> List[Dict[str, Any]]:
     results: List[Optional[Dict[str, Any]]] = [None] * len(request_payloads)
     total = len(request_payloads)
     done = 0
 
-    print(f"   Sending {total} requests with {max_workers} concurrent workers...")
+    print(
+        f"   Sending {total} requests with {max_workers} concurrent workers (provider={provider})..."
+    )
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         fut_to_i = {
-            ex.submit(send_request, payload): i
+            ex.submit(send_request, payload, provider): i
             for i, payload in enumerate(request_payloads)
         }
 
@@ -154,6 +163,15 @@ def send_requests_in_parallel(
             time.sleep(0.05)
 
     return [r if r is not None else {} for r in results]
+
+
+def generation_max_workers(provider: str) -> int:
+    env_name = "CODA_MAX_WORKERS" if provider == CODA_PROVIDER else "GENERATION_MAX_WORKERS"
+    default = 4 if provider == CODA_PROVIDER else 16
+    try:
+        return max(1, int(os.getenv(env_name, str(default))))
+    except ValueError:
+        return default
 
 
 @dataclass
@@ -478,9 +496,16 @@ def main(
     framework: str,
     feedback_num: int = 5,
     prefill: bool = False,
+    provider: str = OPENROUTER_PROVIDER,
+    limit: int | None = None,
 ):
     model_response_dir = get_model_responses_dir(framework=framework)
     model_response_dir.mkdir(parents=True, exist_ok=True)
+    if provider == CODA_PROVIDER:
+        # Tell the Coda response parser which framework's translation to
+        # prefer when the agent emits a structured_response with multiple
+        # framework variants.
+        os.environ.setdefault("CODA_TARGET_FRAMEWORK", framework)
     canonical_solutions = load_json_list(path=CANONICAL_SOLUTIONS_DIR)
     canonical_by_task: Dict[str, Dict[str, Any]] = {
         str(sol["task_id"]): sol for sol in canonical_solutions
@@ -497,7 +522,21 @@ def main(
 
     jsonl_path = get_jsonl_path(framework=framework)
     states = build_task_states(jsonl_path, models)
-    print(f"🚀 Loaded {len(states)} model-task states ({len(models)} models x tasks).")
+
+    if limit is not None and limit > 0:
+        kept: List[TaskState] = []
+        per_model_count: Dict[str, int] = {m: 0 for m in models}
+        for st in states:
+            if per_model_count.get(st.model, 0) < limit:
+                kept.append(st)
+                per_model_count[st.model] = per_model_count.get(st.model, 0) + 1
+        states = kept
+        print(f"   --limit {limit}: keeping {len(states)} task-state(s) total")
+
+    print(
+        f"🚀 Loaded {len(states)} model-task states ({len(models)} models x tasks). "
+        f"provider={provider}"
+    )
 
     global_inputs = load_global_inputs(framework)
 
@@ -514,15 +553,19 @@ def main(
         print("Starting API requests...")
 
         reqs = build_requests_for_states(pending, prefill=prefill)
-        raw_responses = send_requests_in_parallel(reqs, max_workers=16)
+        raw_responses = send_requests_in_parallel(
+            reqs, max_workers=generation_max_workers(provider), provider=provider
+        )
 
         for st, req, raw in zip(pending, reqs, raw_responses):
             assistant_text = extract_assistant_text(raw)
 
             parsed = None
             code = ""
+            provider_error = raw.get("error")
             try:
                 parsed = parse_response((raw, st.signature_prefill), st.entry_point)
+                provider_error = parsed.get("error") or provider_error
                 code = (
                     parsed.get("code")
                     or parsed.get("generated_code")
@@ -533,14 +576,22 @@ def main(
                 code = assistant_text
 
             st.attempts_used += 1
-            eval_res = evaluate_generated_code(
-                task_id=st.task_id,
-                entry_point=st.entry_point,
-                code=code,
-                framework=framework,
-                canonical_by_task=canonical_by_task,
-                inputss=global_inputs,
-            )
+            if provider_error:
+                eval_res = EvalResult(
+                    compiled=False,
+                    ran=False,
+                    kl_div_bool=False,
+                    error=f"Provider error: {provider_error}",
+                )
+            else:
+                eval_res = evaluate_generated_code(
+                    task_id=st.task_id,
+                    entry_point=st.entry_point,
+                    code=code,
+                    framework=framework,
+                    canonical_by_task=canonical_by_task,
+                    inputss=global_inputs,
+                )
 
             feedback_to_model = ""
             if eval_res.kl_div_bool:
@@ -646,11 +697,33 @@ if __name__ == "__main__":
     parser.add_argument(
         "--feedback_num", type=int, default=5, help="Max attempts per task"
     )
+    parser.add_argument(
+        "--provider",
+        type=str,
+        default=OPENROUTER_PROVIDER,
+        choices=list(SUPPORTED_PROVIDERS),
+        help="Generation provider (default: openrouter). Use 'coda' to "
+        "benchmark the Coda agent; pass model labels like 'coda/build' so "
+        "result files group by Coda mode.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="If set, keep only the first N tasks per model (smoke testing).",
+    )
     args = parser.parse_args()
 
-    models = args.models if args.models else DEFAULT_MODELS
+    if args.models:
+        models = args.models
+    elif args.provider == CODA_PROVIDER:
+        models = ["coda/build"]
+    else:
+        models = DEFAULT_MODELS
     main(
         models=models,
         framework=args.framework,
         feedback_num=args.feedback_num,
+        provider=args.provider,
+        limit=args.limit,
     )

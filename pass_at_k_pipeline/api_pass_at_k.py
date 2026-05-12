@@ -10,16 +10,21 @@ from pass_at_k_pipeline.cirq_pip.paths import (
 from pass_at_k_pipeline.qiskit_pip.paths import (
     MODEL_RESPONSES_DIR as MODEL_RESPONSES_DIR_QISKIT,
 )
+import os
 import time
 from typing import Any, Dict, List
 from utils.parse_prompt import parse_prompt
 from utils.get_function_signature_from_prompt import get_function_signature_from_prompt
 from utils.read_jsonl import read_jsonl
 from utils.parse_response import parse_response
+from utils.providers import (
+    CODA_PROVIDER,
+    OPENROUTER_PROVIDER,
+    SUPPORTED_PROVIDERS,
+    send_generation_request,
+)
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests
 from dotenv import load_dotenv
-import os
 import json
 import argparse
 from pass_at_k_pipeline.defaults import DEFAULT_MODELS
@@ -27,29 +32,13 @@ from pass_at_k_pipeline.defaults import DEFAULT_MODELS
 load_dotenv()
 
 
-def send_request(request):
-    api_key = os.getenv("API_KEY")
-    print("Sending request to", request.get("model"))
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    messages = request.get("messages") or []
-    if len(messages) > 1 and isinstance(messages[1], dict):
-        chat_completion = messages[1].get("content") or ""
-    try:
-        # print("Request is: ", request)
-        response = requests.post(url, json=request, headers=headers)
-        if response.status_code != 200:
-            return (
-                {"error": {"status_code": response.status_code, "body": response.text}},
-                chat_completion,
-            )
-        data = response.json()
-        # print(data)
-        return data, chat_completion
-    except Exception as e:
-        print("ERROR SENDING REQUEST")
-        print(e)
-        return {"error": str(e)}
+def send_request(request: Dict[str, Any], provider: str = OPENROUTER_PROVIDER):
+    """Dispatch a single request via the chosen provider.
+
+    Returns ``(normalized_response, chat_completion_prefill)`` so the
+    existing ``parse_response`` tuple contract still holds.
+    """
+    return send_generation_request(request, provider)
 
 
 def parse_requests(json_path: str, models: list):
@@ -87,19 +76,19 @@ def process_single_task_pass_k(args):
     Process ONE (task, version) sample.
     Returns (task_index, version, enriched_result).
     """
-    task_index, request, task_info, version, pass_k = args
+    task_index, request, task_info, version, pass_k, provider = args
     entry_point = task_info.get("entry_point")
     single_request = {k: v for k, v in request.items() if k != "n"}
     single_request.setdefault("temperature", 0.8)
     if pass_k > 1:
         single_request["temperature"] = 0.8
     try:
-        raw_response = send_request(single_request)
+        raw_response = send_request(single_request, provider=provider)
         parsed_response = parse_response(raw_response, entry_point)
 
         enriched_result = {
-            **task_info,  # task_id, entry_point, category, model, ...
             **parsed_response,
+            **task_info,  # task_id, entry_point, category, requested model label, ...
             "version": version,
         }
         return task_index, version, enriched_result
@@ -109,6 +98,7 @@ def process_single_task_pass_k(args):
         )
         error_result = {
             "id": f"error-{int(time.time())}-{task_index}-v{version}",
+            "error": {"status_code": 0, "body": str(exc)},
             "choices": [
                 {
                     "finish_reason": "error",
@@ -130,7 +120,16 @@ def process_single_task_pass_k(args):
         return task_index, version, error_result
 
 
-def process_requests_pass_k(requests, tasks_info, pass_k):
+def _generation_max_workers(provider: str) -> int:
+    env_name = "CODA_MAX_WORKERS" if provider == CODA_PROVIDER else "GENERATION_MAX_WORKERS"
+    default = 4 if provider == CODA_PROVIDER else 16
+    try:
+        return max(1, int(os.getenv(env_name, str(default))))
+    except ValueError:
+        return default
+
+
+def process_requests_pass_k(requests, tasks_info, pass_k, provider=OPENROUTER_PROVIDER):
     """
     Fully-parallel pass@k:
     Submits len(requests) * pass_k independent jobs to the thread pool.
@@ -139,16 +138,18 @@ def process_requests_pass_k(requests, tasks_info, pass_k):
     total_tasks = len(requests)
     total_calls = total_tasks * pass_k
     completed = 0
+    max_workers = _generation_max_workers(provider)
     print(
-        f"   Sending {total_calls} requests with 16 concurrent workers (pass@{pass_k})..."
+        f"   Sending {total_calls} requests with {max_workers} concurrent workers "
+        f"(pass@{pass_k}, provider={provider})..."
     )
     results = [None] * total_calls
     all_args = []
     for i, (req, info) in enumerate(zip(requests, tasks_info)):
         for v in range(1, pass_k + 1):
-            all_args.append((i, req, info, v, pass_k))
+            all_args.append((i, req, info, v, pass_k, provider))
 
-    with ThreadPoolExecutor(max_workers=16) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_key = {
             executor.submit(process_single_task_pass_k, args): (args[0], args[3])
             for args in all_args
@@ -216,15 +217,41 @@ def get_model_reponses_dir(framework: str):
         return MODEL_RESPONSES_DIR_QISKIT
 
 
-def main(models: list, framework: str, pass_k: int = 1):
+def main(
+    models: list,
+    framework: str,
+    pass_k: int = 1,
+    provider: str = OPENROUTER_PROVIDER,
+    limit: int | None = None,
+):
     all_results: Dict[str, List[Dict[str, Any]]] = {f"{framework}": []}
     jsonl_path = get_jsonl_path(framework=framework)
     model_response_dir = get_model_reponses_dir(framework=framework)
-    print("Starting API requests...")
+    if provider == CODA_PROVIDER:
+        # Tell the Coda response parser which framework's translation to
+        # prefer when the agent emits a structured_response with multiple
+        # framework variants. This makes the parser robust to Coda's
+        # internal pivot framework.
+        os.environ.setdefault("CODA_TARGET_FRAMEWORK", framework)
+    print(f"Starting API requests via provider={provider}...")
     requestss, tasks_info = parse_requests(jsonl_path, models)
 
+    if limit is not None and limit > 0:
+        # Slice each model's task block while preserving model ordering.
+        kept_requests: List[Dict[str, Any]] = []
+        kept_info: List[Dict[str, Any]] = []
+        per_model_count: Dict[str, int] = {m: 0 for m in models}
+        for req, info in zip(requestss, tasks_info):
+            model_name = info.get("model")
+            if per_model_count.get(model_name, 0) < limit:
+                kept_requests.append(req)
+                kept_info.append(info)
+                per_model_count[model_name] = per_model_count.get(model_name, 0) + 1
+        requestss, tasks_info = kept_requests, kept_info
+        print(f"   --limit {limit}: keeping {len(requestss)} task(s) total")
+
     print(f"   Generated {len(requestss)} requests across {len(models)} models")
-    results = process_requests_pass_k(requestss, tasks_info, pass_k)
+    results = process_requests_pass_k(requestss, tasks_info, pass_k, provider=provider)
 
     all_results[f"{framework}"] = results
     print(f"Completed {len(results)} responses")
@@ -264,6 +291,32 @@ if __name__ == "__main__":
         default=1,
         help="Number of samples for pass@k evaluation (default: 1)",
     )
+    parser.add_argument(
+        "--provider",
+        type=str,
+        default=OPENROUTER_PROVIDER,
+        choices=list(SUPPORTED_PROVIDERS),
+        help="Generation provider to use (default: openrouter). Use 'coda' to "
+        "benchmark the Coda agent; pass model labels like 'coda/build' so the "
+        "results files group by Coda mode.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="If set, keep only the first N tasks per model (smoke testing).",
+    )
     args = parser.parse_args()
-    models = args.models if args.models else DEFAULT_MODELS
-    main(models, args.framework, args.pass_k)
+    if args.models:
+        models = args.models
+    elif args.provider == CODA_PROVIDER:
+        models = ["coda/build"]
+    else:
+        models = DEFAULT_MODELS
+    main(
+        models,
+        args.framework,
+        args.pass_k,
+        provider=args.provider,
+        limit=args.limit,
+    )

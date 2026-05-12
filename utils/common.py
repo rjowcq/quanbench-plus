@@ -143,6 +143,30 @@ def add_header_if_missing(code: str, header: str) -> str:
     return "".join(lines[:insert_at]) + header_block + "".join(lines[insert_at:])
 
 
+def provider_error_message(task: Dict[str, Any]) -> str | None:
+    """Return a readable provider error from a model response record, if present."""
+    error = task.get("error")
+    if not error:
+        code = task.get("code")
+        if isinstance(code, str):
+            stripped = code.strip()
+            lower = stripped.lower()
+            if (
+                lower.startswith("agent call failed:")
+                or lower.startswith("agent timed out")
+                or lower.startswith("[stream interrupted:")
+            ):
+                return stripped
+        return None
+    if isinstance(error, dict):
+        status = error.get("status_code")
+        body = error.get("body") or error.get("message") or error
+        if status is not None:
+            return f"status={status}: {body}"
+        return str(body)
+    return str(error)
+
+
 def execute_code_with_args(
     code: str,
     entry_point: str,

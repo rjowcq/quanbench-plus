@@ -10,6 +10,7 @@ from utils.common import (
     load_prompts_jsonl_as_dict,
     add_header_if_missing,
     get_handler,
+    provider_error_message,
     _to_jsonable,
     _extract_token_fields,
     save_json,
@@ -115,6 +116,26 @@ def save_cirq_responses(
     for i, task in enumerate(data):
         raw_task_id = task["task_id"]
         print(f"\n--- Processing task {i + 1}/{len(data)}: task_id={raw_task_id} ---")
+        provider_error = provider_error_message(task)
+        if provider_error:
+            print(f"!! Provider error in task {raw_task_id}: {provider_error}")
+            outputs.append(
+                {
+                    "task_id": raw_task_id,
+                    "category": task.get("category"),
+                    "version": task.get("version"),
+                    **_extract_token_fields(task),
+                    "output": None,
+                    "error": {
+                        "type": "ProviderError",
+                        "message": provider_error,
+                    },
+                }
+            )
+            failures.append(
+                {"task_id": raw_task_id, "type": "ProviderError", "message": provider_error}
+            )
+            continue
 
         try:
             if "code" not in task:
