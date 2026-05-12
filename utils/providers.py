@@ -150,13 +150,19 @@ def _send_openrouter(
 # Bedrock (raw LLM, no agent harness)
 # ---------------------------------------------------------------------------
 def _send_bedrock(request_payload: Dict[str, Any], *, timeout: int) -> Dict[str, Any]:
-    """Call AWS Bedrock's ConverseStream API directly with no system prompt and no tools.
+    """Call AWS Bedrock's Converse API directly with no system prompt and no tools.
 
     Used for the raw-LLM A/B baseline against the Coda agent harness. Only
     the user message is forwarded; assistant prefill is dropped (Bedrock
     Converse expects a final ``user`` turn). Adaptive thinking is enabled at
-    ``effort=high`` to match the Coda build agent's settings, but no system
-    prompt, tools, or langgraph nodes are involved.
+    ``effort=high`` by default to match the Coda build agent's settings, but
+    no system prompt, tools, or langgraph nodes are involved.
+
+    If the first attempt returns no extractable assistant text (which happens
+    when adaptive thinking exhausts the token budget before the model emits
+    any text blocks) or hits ``stopReason="max_tokens"``, the request is
+    retried once with thinking disabled so the entire token budget is
+    available for the answer.
 
     Returns an OpenRouter-shaped response dict so downstream parsers work
     unchanged.
@@ -174,11 +180,12 @@ def _send_bedrock(request_payload: Dict[str, Any], *, timeout: int) -> Dict[str,
 
     model = os.getenv("BEDROCK_MODEL", DEFAULT_BEDROCK_MODEL)
     region = os.getenv("BEDROCK_REGION", DEFAULT_BEDROCK_REGION)
-    max_tokens = _env_int("BEDROCK_MAX_TOKENS", 8000)
+    max_tokens = _env_int("BEDROCK_MAX_TOKENS", 16000)
     effort = os.getenv("BEDROCK_EFFORT", _DEFAULT_BEDROCK_EFFORT).lower()
     if effort not in _BEDROCK_VALID_EFFORTS:
         effort = _DEFAULT_BEDROCK_EFFORT
     enable_thinking = _env_truthy("BEDROCK_THINKING", default=True)
+    fallback_no_thinking = _env_truthy("BEDROCK_FALLBACK_NO_THINKING", default=True)
 
     user_text = _bedrock_user_text(request_payload)
     if not user_text:
@@ -194,36 +201,53 @@ def _send_bedrock(request_payload: Dict[str, Any], *, timeout: int) -> Dict[str,
     except (BotoCoreError, ClientError) as exc:
         return _error_response(status=0, message=f"Could not init bedrock-runtime: {exc}", model=model)
 
-    additional_fields: Dict[str, Any] = {}
-    if enable_thinking:
-        additional_fields["thinking"] = {"type": "adaptive", "display": "summarized"}
-        additional_fields["output_config"] = {"effort": effort}
+    base_temperature = float(request_payload.get("temperature", 0.0))
 
-    converse_kwargs: Dict[str, Any] = {
-        "modelId": model,
-        "messages": [{"role": "user", "content": [{"text": user_text}]}],
-        "inferenceConfig": {
-            "maxTokens": max_tokens,
-            # Adaptive thinking requires temperature=1.0; otherwise honour the
-            # request_payload's value (defaults to 0.0 for n=1, 0.8 for n>1).
-            "temperature": 1.0 if enable_thinking else float(request_payload.get("temperature", 0.0)),
-        },
-    }
-    if additional_fields:
-        converse_kwargs["additionalModelRequestFields"] = additional_fields
-
-    print(f"Sending request to bedrock ({model}, effort={effort if enable_thinking else 'off'})")
-
-    try:
-        response = client.converse(**converse_kwargs)
-    except (BotoCoreError, ClientError) as exc:
-        return _error_response(status=0, message=f"Bedrock converse failed: {exc}", model=model)
+    response, err = _bedrock_converse_once(
+        client=client,
+        model=model,
+        user_text=user_text,
+        max_tokens=max_tokens,
+        thinking=enable_thinking,
+        effort=effort,
+        base_temperature=base_temperature,
+    )
+    if err is not None:
+        return _error_response(status=0, message=err, model=model)
 
     text = _bedrock_extract_text(response)
+    stop_reason = response.get("stopReason") or ""
+    needs_retry = (not text) or stop_reason == "max_tokens"
+    if needs_retry and enable_thinking and fallback_no_thinking:
+        # Retry once with thinking disabled so the full token budget is
+        # available for an actual text answer. This recovers most of the
+        # cases where adaptive thinking ate the entire budget.
+        print(
+            f"bedrock no-text or max_tokens with thinking on (stopReason={stop_reason!r}); "
+            "retrying once with thinking disabled.",
+            file=sys.stderr,
+        )
+        response, err = _bedrock_converse_once(
+            client=client,
+            model=model,
+            user_text=user_text,
+            max_tokens=max_tokens,
+            thinking=False,
+            effort=effort,
+            base_temperature=base_temperature,
+        )
+        if err is not None:
+            return _error_response(status=0, message=err, model=model)
+        text = _bedrock_extract_text(response)
+        stop_reason = response.get("stopReason") or ""
+
     if not text:
         return _error_response(
             status=200,
-            message=f"Bedrock returned no extractable assistant text. Raw output keys: {sorted(response.get('output', {}).keys())}",
+            message=(
+                f"Bedrock returned no extractable assistant text after retry. "
+                f"stopReason={stop_reason!r}, output keys={sorted(response.get('output', {}).keys())}"
+            ),
             model=model,
         )
 
@@ -234,8 +258,8 @@ def _send_bedrock(request_payload: Dict[str, Any], *, timeout: int) -> Dict[str,
         "choices": [
             {
                 "index": 0,
-                "finish_reason": response.get("stopReason", "stop") or "stop",
-                "native_finish_reason": response.get("stopReason", "stop") or "stop",
+                "finish_reason": stop_reason or "stop",
+                "native_finish_reason": stop_reason or "stop",
                 "message": {"role": "assistant", "content": text},
             }
         ],
@@ -245,6 +269,50 @@ def _send_bedrock(request_payload: Dict[str, Any], *, timeout: int) -> Dict[str,
             "total_tokens": usage.get("totalTokens"),
         },
     }
+
+
+def _bedrock_converse_once(
+    *,
+    client: Any,
+    model: str,
+    user_text: str,
+    max_tokens: int,
+    thinking: bool,
+    effort: str,
+    base_temperature: float,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Single Bedrock Converse call. Returns (response_dict, error_message).
+
+    On success returns ``(response, None)``. On botocore failure returns
+    ``(None, "<message>")`` so the caller can build the right error envelope.
+    """
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    additional_fields: Dict[str, Any] = {}
+    if thinking:
+        additional_fields["thinking"] = {"type": "adaptive", "display": "summarized"}
+        additional_fields["output_config"] = {"effort": effort}
+
+    converse_kwargs: Dict[str, Any] = {
+        "modelId": model,
+        "messages": [{"role": "user", "content": [{"text": user_text}]}],
+        "inferenceConfig": {
+            "maxTokens": max_tokens,
+            # Adaptive thinking requires temperature=1.0; otherwise honour the
+            # request_payload's value (defaults to 0.0 for n=1, 0.8 for n>1).
+            "temperature": 1.0 if thinking else base_temperature,
+        },
+    }
+    if additional_fields:
+        converse_kwargs["additionalModelRequestFields"] = additional_fields
+
+    print(f"Sending request to bedrock ({model}, effort={effort if thinking else 'off'})")
+
+    try:
+        response = client.converse(**converse_kwargs)
+    except (BotoCoreError, ClientError) as exc:
+        return None, f"Bedrock converse failed: {exc}"
+    return response, None
 
 
 def _bedrock_user_text(request_payload: Dict[str, Any]) -> str:

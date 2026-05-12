@@ -1177,3 +1177,104 @@ def test_bedrock_honours_model_region_and_max_tokens_env(stub_bedrock, monkeypat
 
 def test_bedrock_provider_in_supported_set():
     assert "bedrock" in providers.SUPPORTED_PROVIDERS
+
+
+# --- retry-without-thinking fallback ---------------------------------------
+
+
+def _bedrock_no_text_response(stop_reason: str = "end_turn") -> Dict[str, Any]:
+    """Build a Bedrock Converse response that has only reasoningContent (no text)."""
+    return {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [{"reasoningContent": {"reasoningText": {"text": "thinking only"}}}],
+            }
+        },
+        "stopReason": stop_reason,
+        "usage": {"inputTokens": 100, "outputTokens": 8000, "totalTokens": 8100},
+    }
+
+
+def _bedrock_text_response(text: str = "```python\nqc = 1\n```", stop_reason: str = "end_turn") -> Dict[str, Any]:
+    return {
+        "output": {"message": {"role": "assistant", "content": [{"text": text}]}},
+        "stopReason": stop_reason,
+        "usage": {"inputTokens": 100, "outputTokens": 50, "totalTokens": 150},
+    }
+
+
+def test_bedrock_retries_without_thinking_when_first_attempt_has_no_text(stub_bedrock, capsys):
+    """If thinking eats the entire token budget so the model emits no text, we retry once with thinking off."""
+    text_response = _bedrock_text_response()
+    no_text_response = _bedrock_no_text_response("end_turn")
+
+    call_count = {"n": 0}
+
+    def converse_with_fallback(**kwargs):
+        stub_bedrock.calls.append(kwargs)
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return no_text_response
+        return text_response
+
+    stub_bedrock.converse = converse_with_fallback  # type: ignore[assignment]
+
+    response, _ = providers.send_generation_request(_bedrock_payload(), "bedrock")
+
+    assert call_count["n"] == 2, "should retry exactly once"
+    assert "additionalModelRequestFields" in stub_bedrock.calls[0], "first attempt has thinking on"
+    assert "additionalModelRequestFields" not in stub_bedrock.calls[1], "retry has thinking off"
+    assert response["choices"][0]["message"]["content"] == "```python\nqc = 1\n```"
+    err_log = capsys.readouterr().err
+    assert "retrying once with thinking disabled" in err_log
+
+
+def test_bedrock_retries_when_first_attempt_hits_max_tokens(stub_bedrock):
+    """stopReason='max_tokens' on the thinking attempt also triggers the retry."""
+    cut_off = _bedrock_text_response("partial answer", stop_reason="max_tokens")
+    full_answer = _bedrock_text_response("```python\nqc = full\n```", stop_reason="end_turn")
+
+    call_count = {"n": 0}
+
+    def converse(**kwargs):
+        stub_bedrock.calls.append(kwargs)
+        call_count["n"] += 1
+        return cut_off if call_count["n"] == 1 else full_answer
+
+    stub_bedrock.converse = converse  # type: ignore[assignment]
+
+    response, _ = providers.send_generation_request(_bedrock_payload(), "bedrock")
+
+    assert call_count["n"] == 2
+    assert "additionalModelRequestFields" not in stub_bedrock.calls[1]
+    assert response["choices"][0]["message"]["content"] == "```python\nqc = full\n```"
+
+
+def test_bedrock_does_not_retry_if_fallback_disabled(stub_bedrock, monkeypatch):
+    """BEDROCK_FALLBACK_NO_THINKING=false suppresses the retry; the no-text error envelope is returned as-is."""
+    monkeypatch.setenv("BEDROCK_FALLBACK_NO_THINKING", "false")
+    stub_bedrock.response = _bedrock_no_text_response("end_turn")
+
+    response = providers.send_generation_request_dict(_bedrock_payload(), "bedrock")
+
+    assert len(stub_bedrock.calls) == 1, "no retry attempted"
+    assert response["error"]["status_code"] == 200
+    assert "no extractable assistant text" in response["error"]["body"].lower()
+
+
+def test_bedrock_does_not_retry_when_thinking_already_off(stub_bedrock, monkeypatch):
+    """If the first call already has thinking=off, a no-text response can't be fixed by re-disabling it."""
+    monkeypatch.setenv("BEDROCK_THINKING", "false")
+    stub_bedrock.response = _bedrock_no_text_response("end_turn")
+
+    response = providers.send_generation_request_dict(_bedrock_payload(), "bedrock")
+
+    assert len(stub_bedrock.calls) == 1
+    assert response["error"]["status_code"] == 200
+
+
+def test_bedrock_default_max_tokens_is_16k(stub_bedrock, monkeypatch):
+    monkeypatch.delenv("BEDROCK_MAX_TOKENS", raising=False)
+    providers.send_generation_request_dict(_bedrock_payload(), "bedrock")
+    assert stub_bedrock.calls[0]["inferenceConfig"]["maxTokens"] == 16000
