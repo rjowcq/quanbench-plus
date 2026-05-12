@@ -18,6 +18,7 @@ from utils.get_function_signature_from_prompt import get_function_signature_from
 from utils.read_jsonl import read_jsonl
 from utils.parse_response import parse_response
 from utils.providers import (
+    BEDROCK_PROVIDER,
     CODA_PROVIDER,
     OPENROUTER_PROVIDER,
     SUPPORTED_PROVIDERS,
@@ -121,8 +122,14 @@ def process_single_task_pass_k(args):
 
 
 def _generation_max_workers(provider: str) -> int:
-    env_name = "CODA_MAX_WORKERS" if provider == CODA_PROVIDER else "GENERATION_MAX_WORKERS"
-    default = 4 if provider == CODA_PROVIDER else 16
+    if provider == CODA_PROVIDER:
+        env_name, default = "CODA_MAX_WORKERS", 4
+    elif provider == BEDROCK_PROVIDER:
+        # Bedrock account limits throttle aggressively; default 2 keeps the
+        # raw-LLM benchmark stable when run alongside another sweep.
+        env_name, default = "BEDROCK_MAX_WORKERS", 2
+    else:
+        env_name, default = "GENERATION_MAX_WORKERS", 16
     try:
         return max(1, int(os.getenv(env_name, str(default))))
     except ValueError:
@@ -311,6 +318,8 @@ if __name__ == "__main__":
         models = args.models
     elif args.provider == CODA_PROVIDER:
         models = ["coda/build"]
+    elif args.provider == BEDROCK_PROVIDER:
+        models = ["bedrock/opus-4-6"]
     else:
         models = DEFAULT_MODELS
     main(

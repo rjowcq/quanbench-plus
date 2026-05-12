@@ -25,11 +25,21 @@ import requests
 
 OPENROUTER_PROVIDER = "openrouter"
 CODA_PROVIDER = "coda"
-SUPPORTED_PROVIDERS = (OPENROUTER_PROVIDER, CODA_PROVIDER)
+BEDROCK_PROVIDER = "bedrock"
+SUPPORTED_PROVIDERS = (OPENROUTER_PROVIDER, CODA_PROVIDER, BEDROCK_PROVIDER)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_CODA_BASE_URL = "https://api.conductorquantum.com/v0/coda"
 DEFAULT_CODA_MODEL_LABEL = "coda/build"
+
+# Default Bedrock model and region for the raw-LLM benchmark path.
+# Pinned to the same model the Coda build agent uses so the comparison
+# isolates the contribution of the Coda harness vs the underlying LLM.
+DEFAULT_BEDROCK_MODEL = "global.anthropic.claude-opus-4-6-v1"
+DEFAULT_BEDROCK_REGION = "us-west-1"
+# Bedrock Converse caps thinking effort at 'low|medium|high|max' for Opus 4.6.
+_BEDROCK_VALID_EFFORTS = frozenset({"low", "medium", "high", "max"})
+_DEFAULT_BEDROCK_EFFORT = "high"
 
 # Roles Coda's AgentsMessageRole enum allows. The OpenRouter prompt builders
 # only ever emit ``user`` and ``assistant``, but the provider rejects anything
@@ -67,6 +77,8 @@ def send_generation_request(
     chat_completion = _extract_chat_completion(request_payload)
     if provider == OPENROUTER_PROVIDER:
         response = _send_openrouter(request_payload, timeout=timeout)
+    elif provider == BEDROCK_PROVIDER:
+        response = _send_bedrock(request_payload, timeout=timeout)
     else:
         response = _send_coda(request_payload, timeout=_coda_request_timeout(timeout))
     return response, chat_completion
@@ -132,6 +144,129 @@ def _send_openrouter(
             message=f"Could not decode OpenRouter response as JSON: {exc}; body={response.text[:1000]}",
             model=request_payload.get("model"),
         )
+
+
+# ---------------------------------------------------------------------------
+# Bedrock (raw LLM, no agent harness)
+# ---------------------------------------------------------------------------
+def _send_bedrock(request_payload: Dict[str, Any], *, timeout: int) -> Dict[str, Any]:
+    """Call AWS Bedrock's ConverseStream API directly with no system prompt and no tools.
+
+    Used for the raw-LLM A/B baseline against the Coda agent harness. Only
+    the user message is forwarded; assistant prefill is dropped (Bedrock
+    Converse expects a final ``user`` turn). Adaptive thinking is enabled at
+    ``effort=high`` to match the Coda build agent's settings, but no system
+    prompt, tools, or langgraph nodes are involved.
+
+    Returns an OpenRouter-shaped response dict so downstream parsers work
+    unchanged.
+    """
+    try:
+        import boto3
+        from botocore.config import Config as _BotoConfig
+        from botocore.exceptions import BotoCoreError, ClientError
+    except ImportError as exc:
+        return _error_response(
+            status=0,
+            message=f"boto3 is required for the bedrock provider: {exc}",
+            model=DEFAULT_BEDROCK_MODEL,
+        )
+
+    model = os.getenv("BEDROCK_MODEL", DEFAULT_BEDROCK_MODEL)
+    region = os.getenv("BEDROCK_REGION", DEFAULT_BEDROCK_REGION)
+    max_tokens = _env_int("BEDROCK_MAX_TOKENS", 8000)
+    effort = os.getenv("BEDROCK_EFFORT", _DEFAULT_BEDROCK_EFFORT).lower()
+    if effort not in _BEDROCK_VALID_EFFORTS:
+        effort = _DEFAULT_BEDROCK_EFFORT
+    enable_thinking = _env_truthy("BEDROCK_THINKING", default=True)
+
+    user_text = _bedrock_user_text(request_payload)
+    if not user_text:
+        return _error_response(
+            status=0,
+            message="bedrock provider received an empty user message; nothing to send.",
+            model=model,
+        )
+
+    boto_config = _BotoConfig(retries={"max_attempts": 10, "mode": "adaptive"}, read_timeout=max(timeout, 600))
+    try:
+        client = boto3.client("bedrock-runtime", region_name=region, config=boto_config)
+    except (BotoCoreError, ClientError) as exc:
+        return _error_response(status=0, message=f"Could not init bedrock-runtime: {exc}", model=model)
+
+    additional_fields: Dict[str, Any] = {}
+    if enable_thinking:
+        additional_fields["thinking"] = {"type": "adaptive", "display": "summarized"}
+        additional_fields["output_config"] = {"effort": effort}
+
+    converse_kwargs: Dict[str, Any] = {
+        "modelId": model,
+        "messages": [{"role": "user", "content": [{"text": user_text}]}],
+        "inferenceConfig": {
+            "maxTokens": max_tokens,
+            # Adaptive thinking requires temperature=1.0; otherwise honour the
+            # request_payload's value (defaults to 0.0 for n=1, 0.8 for n>1).
+            "temperature": 1.0 if enable_thinking else float(request_payload.get("temperature", 0.0)),
+        },
+    }
+    if additional_fields:
+        converse_kwargs["additionalModelRequestFields"] = additional_fields
+
+    print(f"Sending request to bedrock ({model}, effort={effort if enable_thinking else 'off'})")
+
+    try:
+        response = client.converse(**converse_kwargs)
+    except (BotoCoreError, ClientError) as exc:
+        return _error_response(status=0, message=f"Bedrock converse failed: {exc}", model=model)
+
+    text = _bedrock_extract_text(response)
+    if not text:
+        return _error_response(
+            status=200,
+            message=f"Bedrock returned no extractable assistant text. Raw output keys: {sorted(response.get('output', {}).keys())}",
+            model=model,
+        )
+
+    usage = response.get("usage") or {}
+    return {
+        "id": f"bedrock-{int(time.time() * 1000)}",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": response.get("stopReason", "stop") or "stop",
+                "native_finish_reason": response.get("stopReason", "stop") or "stop",
+                "message": {"role": "assistant", "content": text},
+            }
+        ],
+        "usage": {
+            "prompt_tokens": usage.get("inputTokens"),
+            "completion_tokens": usage.get("outputTokens"),
+            "total_tokens": usage.get("totalTokens"),
+        },
+    }
+
+
+def _bedrock_user_text(request_payload: Dict[str, Any]) -> str:
+    """Pick the first user message from the OpenRouter-shaped request_payload."""
+    for msg in request_payload.get("messages") or []:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+    return ""
+
+
+def _bedrock_extract_text(response: Dict[str, Any]) -> str:
+    """Concatenate the ``text`` blocks in a Bedrock Converse response, ignoring thinking."""
+    output = response.get("output") or {}
+    message = output.get("message") or {}
+    blocks = message.get("content") or []
+    parts: List[str] = []
+    for block in blocks:
+        if isinstance(block, dict) and isinstance(block.get("text"), str):
+            parts.append(block["text"])
+    return "".join(parts)
 
 
 # ---------------------------------------------------------------------------

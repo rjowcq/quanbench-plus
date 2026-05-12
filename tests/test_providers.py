@@ -21,6 +21,7 @@ this file performs real network I/O.
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any, Dict, Iterable, List, Optional
 
 import pytest
@@ -995,3 +996,184 @@ def test_retry_logs_to_stderr(monkeypatch, no_sleep, capsys):
     err = capsys.readouterr().err
     assert "HTTP 502" in err
     assert "retrying" in err
+
+
+# ---------------------------------------------------------------------------
+# Bedrock (raw LLM, no agent harness)
+# ---------------------------------------------------------------------------
+class _StubBedrockClient:
+    """Minimal stand-in for a boto3 ``bedrock-runtime`` client used in tests.
+
+    Records every ``converse`` call and returns a configurable response so we
+    can assert both wire shape (modelId, messages, additional fields) and
+    response normalisation independently.
+    """
+
+    def __init__(self, response: Optional[Dict[str, Any]] = None, raise_with: Optional[Exception] = None) -> None:
+        self.response = response or {
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"text": "```python\nqc = 1\n```"}],
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15},
+        }
+        self.raise_with = raise_with
+        self.calls: List[Dict[str, Any]] = []
+
+    def converse(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.raise_with is not None:
+            raise self.raise_with
+        return self.response
+
+
+@pytest.fixture
+def stub_bedrock(monkeypatch):
+    """Yield a ``_StubBedrockClient`` that the provider's ``boto3.client`` returns."""
+
+    stub = _StubBedrockClient()
+
+    class _StubBoto3Module:
+        @staticmethod
+        def client(service, region_name=None, config=None):  # noqa: ARG004
+            assert service == "bedrock-runtime"
+            stub.last_region = region_name
+            return stub
+
+    class _StubBotocoreConfigModule:
+        @staticmethod
+        def Config(**kwargs):  # noqa: N802 — mirrors botocore's class name
+            return kwargs
+
+    class _StubBotocoreExceptionsModule:
+        BotoCoreError = type("BotoCoreError", (Exception,), {})
+        ClientError = type("ClientError", (Exception,), {})
+
+    import sys as _sys
+
+    monkeypatch.setitem(_sys.modules, "boto3", _StubBoto3Module())
+    monkeypatch.setitem(_sys.modules, "botocore", type("M", (), {}))
+    monkeypatch.setitem(_sys.modules, "botocore.config", _StubBotocoreConfigModule())
+    monkeypatch.setitem(_sys.modules, "botocore.exceptions", _StubBotocoreExceptionsModule())
+    return stub
+
+
+def _bedrock_payload(text="Complete this circuit", **extra):
+    return {"messages": [{"role": "user", "content": text}], **extra}
+
+
+def test_bedrock_sends_only_user_message_no_system_prompt(stub_bedrock, monkeypatch):
+    monkeypatch.delenv("BEDROCK_MODEL", raising=False)
+    monkeypatch.delenv("BEDROCK_REGION", raising=False)
+    providers.send_generation_request_dict(
+        _bedrock_payload("Build a Bell state in Qiskit"), "bedrock"
+    )
+    assert len(stub_bedrock.calls) == 1
+    call = stub_bedrock.calls[0]
+    assert call["modelId"] == providers.DEFAULT_BEDROCK_MODEL
+    assert call["messages"] == [{"role": "user", "content": [{"text": "Build a Bell state in Qiskit"}]}]
+    assert "system" not in call, "no system prompt should be sent in raw-LLM mode"
+    assert "tools" not in call, "no tools should be sent in raw-LLM mode"
+    assert "toolConfig" not in call, "no tool config should be sent in raw-LLM mode"
+
+
+def test_bedrock_includes_adaptive_thinking_by_default(stub_bedrock):
+    providers.send_generation_request_dict(_bedrock_payload(), "bedrock")
+    fields = stub_bedrock.calls[0]["additionalModelRequestFields"]
+    assert fields["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert fields["output_config"]["effort"] == "high"
+    # Adaptive thinking requires temperature=1.0.
+    assert stub_bedrock.calls[0]["inferenceConfig"]["temperature"] == 1.0
+
+
+def test_bedrock_thinking_can_be_disabled(stub_bedrock, monkeypatch):
+    monkeypatch.setenv("BEDROCK_THINKING", "false")
+    providers.send_generation_request_dict(
+        _bedrock_payload(), "bedrock"
+    )
+    call = stub_bedrock.calls[0]
+    assert "additionalModelRequestFields" not in call
+    # Without thinking the request honours the request_payload's temperature.
+    assert call["inferenceConfig"]["temperature"] == 0.0
+
+
+def test_bedrock_clamps_unknown_effort_to_high(stub_bedrock, monkeypatch):
+    monkeypatch.setenv("BEDROCK_EFFORT", "xhigh")  # 4.7-only value, invalid for 4.6
+    providers.send_generation_request_dict(_bedrock_payload(), "bedrock")
+    fields = stub_bedrock.calls[0]["additionalModelRequestFields"]
+    assert fields["output_config"]["effort"] == "high"
+
+
+def test_bedrock_normalises_response_to_openrouter_shape(stub_bedrock):
+    response, _ = providers.send_generation_request(
+        _bedrock_payload(), "bedrock"
+    )
+    assert response["model"] == providers.DEFAULT_BEDROCK_MODEL
+    assert response["choices"][0]["message"]["content"] == "```python\nqc = 1\n```"
+    assert response["choices"][0]["finish_reason"] == "end_turn"
+    assert response["usage"] == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+
+
+def test_bedrock_concatenates_multiple_text_blocks(stub_bedrock):
+    stub_bedrock.response = {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"text": "first "},
+                    {"reasoningContent": {"reasoningText": {"text": "thinking"}}},
+                    {"text": "second"},
+                ],
+            }
+        },
+        "stopReason": "end_turn",
+        "usage": {},
+    }
+    response, _ = providers.send_generation_request(_bedrock_payload(), "bedrock")
+    assert response["choices"][0]["message"]["content"] == "first second"
+
+
+def test_bedrock_empty_user_message_is_an_error(stub_bedrock):
+    response = providers.send_generation_request_dict(
+        {"messages": [{"role": "user", "content": ""}]}, "bedrock"
+    )
+    assert response["error"]["status_code"] == 0
+    assert "empty user message" in response["error"]["body"].lower()
+    assert stub_bedrock.calls == []
+
+
+def test_bedrock_propagates_client_error_into_envelope(stub_bedrock):
+    err_cls = sys.modules["botocore.exceptions"].ClientError
+    stub_bedrock.raise_with = err_cls("ThrottlingException")
+    response = providers.send_generation_request_dict(_bedrock_payload(), "bedrock")
+    assert response["error"]["status_code"] == 0
+    assert "Bedrock converse failed" in response["error"]["body"]
+
+
+def test_bedrock_no_extractable_text_is_a_200_error(stub_bedrock):
+    stub_bedrock.response = {
+        "output": {"message": {"role": "assistant", "content": [{"reasoningContent": {}}]}},
+        "stopReason": "end_turn",
+        "usage": {},
+    }
+    response = providers.send_generation_request_dict(_bedrock_payload(), "bedrock")
+    assert response["error"]["status_code"] == 200
+    assert "no extractable assistant text" in response["error"]["body"].lower()
+
+
+def test_bedrock_honours_model_region_and_max_tokens_env(stub_bedrock, monkeypatch):
+    monkeypatch.setenv("BEDROCK_MODEL", "global.anthropic.claude-opus-4-7")
+    monkeypatch.setenv("BEDROCK_REGION", "us-east-1")
+    monkeypatch.setenv("BEDROCK_MAX_TOKENS", "1234")
+    providers.send_generation_request_dict(_bedrock_payload(), "bedrock")
+    call = stub_bedrock.calls[0]
+    assert call["modelId"] == "global.anthropic.claude-opus-4-7"
+    assert stub_bedrock.last_region == "us-east-1"
+    assert call["inferenceConfig"]["maxTokens"] == 1234
+
+
+def test_bedrock_provider_in_supported_set():
+    assert "bedrock" in providers.SUPPORTED_PROVIDERS

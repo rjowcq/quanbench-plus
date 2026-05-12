@@ -26,7 +26,7 @@ print_help () {
   echo ""
   echo "  --framework, --lang    Target quantum SDK: cirq | qiskit | pennylane   (default: cirq)"
   echo "  --pass_k               Pass@k samples (default: 1)"
-  echo "  --provider             Generation provider: openrouter | coda          (default: openrouter)"
+  echo "  --provider             Generation provider: openrouter | coda | bedrock (default: openrouter)"
   echo "  --limit                Smoke-test: only run the first N tasks per model"
   echo ""
   echo "Provider notes:"
@@ -34,12 +34,18 @@ print_help () {
   echo "  coda                   Reads CODA_API_KEY from .env. Use a label like 'coda/build'"
   echo "                         so result files group by Coda mode. The Coda agent is the"
   echo "                         generator; --framework still selects the target SDK."
+  echo "  bedrock                Calls AWS Bedrock Converse directly with no system prompt,"
+  echo "                         no tools, and no agent harness. Honours BEDROCK_MODEL,"
+  echo "                         BEDROCK_REGION, BEDROCK_EFFORT (low|medium|high|max),"
+  echo "                         BEDROCK_THINKING (default on). Pass any label as the"
+  echo "                         model arg; it is only used to name the result files."
   echo ""
   echo "Examples:"
   echo "  bash $(basename "$0") --framework cirq --pass_k 5 \"openai/gpt-4.1\""
   echo "  bash $(basename "$0") --framework qiskit \"deepseek/deepseek-chat\""
   echo "  bash $(basename "$0") --provider coda --framework qiskit --pass_k 1 coda/build"
   echo "  bash $(basename "$0") --provider coda --framework cirq --limit 1 coda/build"
+  echo "  bash $(basename "$0") --provider bedrock --framework qiskit bedrock/opus-4-6"
 }
 
 # Parse arguments
@@ -76,6 +82,9 @@ if [ ${#MODELS[@]} -eq 0 ]; then
   if [ "$PROVIDER" = "coda" ]; then
     MODELS=("coda/build")
     echo "No model passed; defaulting to 'coda/build' for --provider coda."
+  elif [ "$PROVIDER" = "bedrock" ]; then
+    MODELS=("bedrock/opus-4-6")
+    echo "No model passed; defaulting to 'bedrock/opus-4-6' for --provider bedrock."
   else
     print_help
     exit 1
@@ -100,9 +109,9 @@ case "$FRAMEWORK" in
 esac
 
 case "$PROVIDER" in
-  openrouter|coda) ;;
+  openrouter|coda|bedrock) ;;
   *)
-    echo "Error: unknown provider '$PROVIDER'. Use: openrouter | coda" >&2
+    echo "Error: unknown provider '$PROVIDER'. Use: openrouter | coda | bedrock" >&2
     exit 1
     ;;
 esac
