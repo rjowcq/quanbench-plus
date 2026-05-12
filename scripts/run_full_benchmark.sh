@@ -121,7 +121,11 @@ say "frameworks=${FRAMEWORKS[*]} pass1=$RUN_PASS1 pass5=$RUN_PASS5 feedback=$RUN
 
 say "Pre-flight: provider auth smoke (1 short prompt)..."
 PRE_LOG="$LOG_DIR/preflight_provider.log"
-if python -m utils.providers --provider "$PROVIDER" --prompt "Reply with the single word OK." > "$PRE_LOG" 2>&1; then
+PREFLIGHT_ARGS=(--provider "$PROVIDER" --prompt "Reply with the single word OK.")
+if [ "$PROVIDER" = "openrouter" ]; then
+  PREFLIGHT_ARGS+=(--model "$MODEL_LABEL")
+fi
+if python -m utils.providers "${PREFLIGHT_ARGS[@]}" > "$PRE_LOG" 2>&1; then
   if grep -q '"error"' "$PRE_LOG"; then
     say "FATAL: pre-flight reported an error envelope. See $PRE_LOG. Aborting."
     echo

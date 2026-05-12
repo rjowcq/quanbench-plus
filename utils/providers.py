@@ -103,11 +103,11 @@ def send_generation_request_dict(
 def _send_openrouter(
     request_payload: Dict[str, Any], *, timeout: int
 ) -> Dict[str, Any]:
-    api_key = os.getenv("API_KEY")
+    api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("API_KEY")
     if not api_key:
         return _error_response(
             status=0,
-            message="Missing API_KEY in environment for OpenRouter.",
+            message="Missing OPENROUTER_API_KEY (or legacy API_KEY) in environment for OpenRouter.",
             model=request_payload.get("model"),
         )
     headers = {
